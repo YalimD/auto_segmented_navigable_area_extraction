@@ -275,7 +275,6 @@ if __name__ == "__main__":
     # Param list:
     # .py pedestrian_detection_data <img-folder-list>
     if len(sys.argv) < 3:
-        process_image("corrected_shadow_test.png", "out1.txt", debugging, spatialIncluded, resizing)
         print("usage ped_detect_data <img-folder-list>")
         sys.exit(2)
 
