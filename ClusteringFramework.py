@@ -97,7 +97,7 @@ def generate_segments(data, img, img_name, colorSpace, resizing):
 
             result = np.reshape(colors, img.shape).astype("uint8")
             cv2.imshow("Color Result of {} algorithm on {} image".format(str(algorithms[v]), colorSpace), result)
-            cv2.waitKey(0)
+            cv2.waitKey(5)
             cv2.destroyAllWindows()
 
         # Grayscale resulting image
@@ -111,7 +111,7 @@ def generate_segments(data, img, img_name, colorSpace, resizing):
 
 
 # Prepare the image for clustering and extract the results
-def process_image(img_name, detection_file, debugging=0, spatialIncluded=True, resizing=1):
+def process_image(img_name, detection_file,  resizing=1):
     print("Processing image " + img_name)
     org_image = cv2.imread(img_name)
     # Image order
@@ -173,60 +173,46 @@ def extract_navigable_areas(segmented_img, resizing, pedest_loc):
         canvas_img = np.copy(segmented_img)
         canvas_img = cv2.cvtColor(canvas_img, cv2.COLOR_GRAY2BGR)
         cv2.imshow("Grayscale Segments", segmented_img)
-        cv2.waitKey(0)
+        cv2.waitKey(10)
 
-    frame_index = 0
-    fps = 30  # Default
+    prev_frame = 0
     navigable_labels = []
 
     # Read the segmented image and check the labels that are within, to see if they are actually distinct
     # Other than what is seems on the resulting image
 
     # Open the pedest_loc file and start parsing
-    # For every fps * 10 * i th line
-    # Seperate by delimeter ","  and read every nth value
     with open(pedest_loc) as pedestrians:
         for i, line in enumerate(pedestrians):
-            if i == 0:  # Information line
-                elems = line.split()
-                fps = int(elems[-1])
-            elif i - 1 == frame_index * fps:
-                frame_index += 1
-                # Process the current line (except the frame number)
-                locations = line.split(',')[1:]
+            locations = line.split(',')
+            feet = list(map(float, locations[-1].split('/')))
 
-                # Every 7 values is an agent (including the agent id, which is irrelevant for us)
-                agents = [locations[i * 7:(i + 1) * 7] for i in range(len(locations) // 7)]
+            frame_index = int(locations[0])
+            if frame_index > prev_frame:
+                prev_frame = frame_index
 
-                # Temporary set to hold detected labels
-                temp_nav = set([])
-                for agent in agents:
-                    # Take the feet position as posY + height / 2
-                    feetPos = (float(agent[2]) + float(agent[6]) / 2) * resizing
+            # Find the label value there, in order to add it to the navigable list
+            pixelValue = segmented_img[int(feet[1] * resizing)][int(feet[0] * resizing)]
 
-                    # Put a dot at the feetpos for debugging the detections' location
-                    if debugging:
-                        cv2.circle(canvas_img, (int(int(agent[1]) * resizing), int(feetPos)), 2,
-                                   (0, 0, 255))
-
-                    # Find the label value there, in order to add it to the navigable list
-                    pixelValue = segmented_img[int(feetPos)][int(int(agent[1]) * resizing)]
-                    # Ignore noisy areas
-                    if not pixelValue == 0:
-                        temp_nav.add(pixelValue)
-                navigable_labels += list(temp_nav)
+            # Ignore noisy areas
+            if not pixelValue == 0:
+                navigable_labels.append(pixelValue)
+                # Put a dot at the feetpos for debugging the detections' location
+                if debugging:
+                    cv2.circle(canvas_img, (int(feet[0]* resizing),int(feet[1] * resizing)), 2,
+                               (0, 0, 255))
 
     navigable_labels_freq = np.bincount(navigable_labels)
     navigable_labels = list(zip(list(set(navigable_labels)), navigable_labels_freq[navigable_labels]))
 
     try:
-        # Detection per frame
-        navigable_func = lambda x: x[1] / frame_index > 0.1
+        # TODO: Detection per frame is used to filter number of navigations in the area
+        navigable_func = lambda x: x[1] / prev_frame > 0.1
         navigable_labels = list(zip(*list(filter(navigable_func, navigable_labels))))[0]
     except IndexError:
         navigable_labels = []
 
-    print("Number of frames processed {}".format(frame_index))
+    print("Number of frames processed {}".format(prev_frame))
     print("Navigable labels: {}".format(navigable_labels))
 
     # In the end, create our mask and multiply it with segmentation result
@@ -268,30 +254,36 @@ def define_foreground(segmented_img):
 
 if __name__ == "__main__":
 
-    debugging = 1
-    spatialIncluded = True
-    resizing = 0.25
+    import argparse
 
-    # Param list:
-    # .py pedestrian_detection_data <img-folder-list>
-    if len(sys.argv) < 3:
-        print("usage ped_detect_data <img-folder-list>")
-        sys.exit(2)
+    parser = argparse.ArgumentParser(description="Apply segmentation algortihms (DB, HDBSCAN, Meanshift) to the given image"
+                                                 "on different color formats (RGB, HSV, LAB, LUV)",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter
+                                     )
+    parser.add_argument('-i', '--image', help="Image file or folder to segment")
+    parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
+    parser.add_argument('-d', '--debug', help="Debugging on or off", const= True,
+                        default=False, nargs='?')
+    parser.add_argument('--useSpatial', help="Use spatial features in segmentation", const= True,
+                        default=True, nargs='?')
+    parser.add_argument('-r', '--resize', help="Amount of resizing applied to image", default=0.25)
+    args = parser.parse_args()
 
-    pedestrian_detection_data = sys.argv[1]
+    pedestrian_detection_data = args.ped_file
 
-    for element in sys.argv[2:]:
-        try:
-            # If image, directly call the method
-            if os.path.isfile(element):
-                process_image(element, pedestrian_detection_data, debugging, spatialIncluded, resizing)
-            else:  # If folder, call the method for every image in it (only goes one level,
-                # doesn't recursively search for images)
-                print("Processing folder " + element)
-                file_list = [element + os.path.sep + file for file in os.listdir(element) if
-                             os.path.isfile(join(element, file))]
-                for image in file_list:
-                    process_image(image, pedestrian_detection_data, debugging, spatialIncluded, resizing)
-        except FileNotFoundError:
-            print(element + " is not found. Ignoring...")
-            continue
+    debugging = args.debug
+    useSpatialFeatures = args.useSpatial
+
+    try:
+        # If image, directly call the method
+        if os.path.isfile(args.image):
+            process_image(args.image, pedestrian_detection_data, args.resize)
+        else:  # If folder, call  the method for every image in it (only goes one level,
+            # doesn't recursively search for images)
+            print("Processing folder " + args.image)
+            file_list = [args.image + os.path.sep + file for file in os.listdir(args.image) if
+                         os.path.isfile(join(args.image, file))]
+            for image in file_list:
+                process_image(image, pedestrian_detection_data, args.resize)
+    except FileNotFoundError:
+        print(args.image + " is not found. Ignoring...")
