@@ -32,7 +32,9 @@ def normalizeColor(color):
 
 # Spatial and color features are extracted from image and prepared for clustering
 def generate_features(imageOI):
-    height, width, colorChannelWidth = imageOI.shape
+
+    colorChannelWidth = imageOI.shape[2] if len(imageOI.shape) > 2 else 1
+    height, width  = imageOI.shape[:2]
 
     # Spatial features doesn't vary on the image_channels as they are not related to color spaces
     yy, xx = np.meshgrid(np.arange(0, width), np.arange(0, height))
@@ -41,38 +43,56 @@ def generate_features(imageOI):
 
     spatialFeatures = np.vstack([xx.ravel(), yy.ravel()]).T  # Column ordered elements
 
-    colorFeatures = np.vstack(list(map(lambda i: imageOI[:, :, i].ravel(), range(colorChannelWidth)))).T
+    if colorChannelWidth > 1:
+        colorFeatures = np.vstack(list(map(lambda i: imageOI[:, :, i].ravel(), range(colorChannelWidth)))).T
+    else:
+        colorFeatures = np.vstack([imageOI[:, :].ravel()]).T
+
 
     # Create the data as 5 dimensional np array that contains color and spatial features
     features = np.zeros((width * height, colorChannelWidth + 2))
+
     features[:, 0:2] = spatialFeatures
     features[:, 2:] = colorFeatures
 
-    features = normalize(features)
+    features = normalize(features, axis = 0, norm="max")
+
+    features[:, 0:2] = features[:, 0:2]
+    features[:, 2:] = 2 * features[:, 2:]
+
 
     return features
 
 
 # Test all algorithms, draw results color images. Labels are considered as pixel values
-def generate_segments(data, img, img_name, colorSpace, resizing):
-    algorithms = OrderedDict((('Mean', cluster.MeanShift), ('DB', cluster.DBSCAN), ('HDB', hdbscan.HDBSCAN)))
+def generate_segments(data, img, img_name, colorSpace):
+
+    algorithms = OrderedDict((
+                              ('DB', cluster.DBSCAN),
+                              ('HDB', hdbscan.HDBSCAN),
+                              ('Mean', cluster.MeanShift),
+                            ))
     kwds = [0] * len(algorithms.keys())
 
-    flatImage = np.reshape(img, [-1, 3])  # For meanshift
+    # We cannot use flatImage as it is missing spatial information
+    # We need to first filter the image using the meanshift THEN CLUSTER MANUALLY using data local maximas
+
     # Bin seeding speeds up the code as the initial locations of the kernels are in the discretized versions of points
     # We estimate the required bandwidth using sklearn's method
-    # TODO: PARAMETERS ARE OPEN TO ADJUSTMENTS
-    kwds[list(algorithms.keys()).index('Mean')] = {'bandwidth': cluster.estimate_bandwidth(X=flatImage,
+    # Parameter: PARAMETERS ARE OPEN TO ADJUSTMENTS
+
+    # Putting emphasis in color
+    mean_data = data
+
+    kwds[list(algorithms.keys()).index('DB')] = {'eps': 0.015, 'min_samples': 6, 'n_jobs': -1}
+    kwds[list(algorithms.keys()).index('HDB')] = {'min_cluster_size': 175}
+    kwds[list(algorithms.keys()).index('Mean')] = {'bandwidth': cluster.estimate_bandwidth(X=mean_data,
                                                                                            n_samples=int(
-                                                                                               flatImage.shape[0] *
-                                                                                               flatImage.shape[
-                                                                                                   1] / 100),
-                                                                                           quantile=0.2,
+                                                                                                img.shape[0] * img.shape[1] / 100),
+                                                                                           quantile=0.1,
                                                                                            n_jobs=-1),
                                                    'n_jobs': -1,
                                                    'bin_seeding': True}
-    kwds[list(algorithms.keys()).index('DB')] = {'eps': 0.015, 'min_samples': 6, 'n_jobs': -1}
-    kwds[list(algorithms.keys()).index('HDB')] = {'min_cluster_size': 50}
 
     cluster_results = [0] * len(algorithms.keys())
     file_names = [0] * len(algorithms.keys())
@@ -82,53 +102,111 @@ def generate_segments(data, img, img_name, colorSpace, resizing):
         print("Starting {}".format(str(algorithms[v])))
 
         if v == 'Mean':
-            labels = algorithms[v](**kwds[i]).fit_predict(flatImage)
+            clustering = cluster.MeanShift(**kwds[i]).fit(mean_data)
+            labels = clustering.labels_
+
+            print("Meanshift bandwith is: {}".format(kwds[i]['bandwidth']))
+
+            #region cluster_process
+
+            #After filtering the image, determine individual clusters using connected components approach
+
+            globalLabel = 0
+
+            label_list = np.unique(labels)
+            label_image = np.reshape(labels, img.shape[:2]).astype("uint8")
+            new_labels = np.zeros_like(label_image)
+
+            for label in label_list:
+
+                # Obtain label contours
+                current_label_image = np.zeros_like(label_image)
+
+                rows, cols = np.where(label_image == label)
+                current_label_image[rows, cols] = 255
+
+                from skimage import measure
+
+                all_labels = measure.label(current_label_image, connectivity=1)
+
+                rows, cols = np.where(all_labels != 0)
+                new_labels[rows, cols] = all_labels[rows, cols] + globalLabel
+                globalLabel += np.max(all_labels)
+
+            #endregion
+
+            labels = np.reshape(new_labels, labels.shape).astype("uint8")
+
+        # MST and DENDROGRAM plotting area
+        # elif v == 'HDB':
+        #     clustering = hdbscan.HDBSCAN(**kwds[i], gen_min_span_tree=True)
+        #     clustering.fit(data)
+        #
+        #     import seaborn as sns
+        #     clustering.minimum_spanning_tree_.plot(edge_cmap='viridis',
+        #                                           edge_alpha=0.6,
+        #                                           node_size=80,
+        #                                           edge_linewidth=2)
+        #
+        #     clustering.condensed_tree_.plot(select_clusters=True, selection_palette=sns.color_palette())
+
         else:
             labels = algorithms[v](**kwds[i]).fit_predict(data)
+
         end_time = time.time()
 
         print("Algorithm {} took {} seconds on {} image ".format(str(algorithms[v]), str(end_time - start_time),
                                                                  colorSpace))
-        # Colored segments for debugging. Some segments may have the same color value, but they are actually different
-        # as seen in the grayscale results; where pixel value is directly its corresponding label
-        if debugging:
-            palette = sea.color_palette('deep', np.unique(labels).max() + 1)
-            colors = [normalizeColor(palette[x]) if x >= 0 else (0.0, 0.0, 0.0) for x in labels]
-
-            result = np.reshape(colors, img.shape).astype("uint8")
-            cv2.imshow("Color Result of {} algorithm on {} image".format(str(algorithms[v]), colorSpace), result)
-            cv2.waitKey(5)
-            cv2.destroyAllWindows()
 
         # Grayscale resulting image
         cluster_results[i] = np.reshape(labels, img.shape[:2]).astype("uint8")
         cluster_results[i] = np.amax(cluster_results[i]) - cluster_results[i]
 
-        file_names[i] = img_name[:img_name.index(".")] + "_" + str(v) + "_" + colorSpace + img_name[
-                                                                                           img_name.index("."):]
+        file_names[i] = img_name[:img_name.rfind(".")] + "_" + str(v) + "_" + colorSpace
+
+        # Colored segments for debugging. Some segments may have the same color value, but they are actually different
+        # as seen in the grayscale results; where pixel value is directly its corresponding label
+        if debugging:
+
+            palette = sea.color_palette('deep', np.unique(labels).max() + 1)
+            colors = [normalizeColor(palette[x]) if x >= 0 else (0.0, 0.0, 0.0) for x in labels]
+
+            result = np.reshape(colors, img.shape).astype("uint8")
+
+            print("Number of clusters: {}", np.unique(labels))
+
+            cv2.imshow("Color Result of {} algorithm on {} image".format(str(algorithms[v]), colorSpace), result)
+            cv2.imwrite("{}_segments{}".format(file_names[i], img_name[img_name.rfind("."):]),result)
+            cv2.waitKey(5)
+
+            cv2.imshow("Original", img)
+            cv2.waitKey(0)
+            # cv2.destroyAllWindows()
 
     return cluster_results, file_names
 
 
 # Prepare the image for clustering and extract the results
 def process_image(img_name, detection_file,  resizing=1):
+
     print("Processing image " + img_name)
     org_image = cv2.imread(img_name)
     # Image order
     image_order = {'RGB': 0, 'LAB': 1, 'HSV': 2, 'LUV': 3}
+
     image_channels = [0] * len(image_order.keys())
 
     # Resizing is done to accelerate the clustering process
-    org_image = cv2.resize(org_image, None, fx=resizing, fy=resizing)
+    resized_image = cv2.resize(org_image, None, fx=resizing, fy=resizing)
 
-    if org_image.shape[2] == 4:  # BGRA conversion
-        org_image = cv2.cvtColor(org_image, cv2.COLOR_BGRA2BGR)
-    image_channels[image_order['LAB']] = cv2.cvtColor(org_image, cv2.COLOR_BGR2LAB)
+    if resized_image.shape[2] == 4:  # BGRA conversion
+        resized_image = cv2.cvtColor(resized_image, cv2.COLOR_BGRA2BGR)
+    image_channels[image_order['LAB']] = cv2.cvtColor(resized_image, cv2.COLOR_BGR2LAB)
 
     # Normal hsv: Hue range 0-180, here 0-360
-    image_channels[image_order['HSV']] = cv2.cvtColor(org_image, cv2.COLOR_BGR2HSV_FULL)
-    image_channels[image_order['LUV']] = cv2.cvtColor(org_image, cv2.COLOR_BGR2LUV)
-    image_channels[image_order['RGB']] = cv2.cvtColor(org_image, cv2.COLOR_BGR2RGB)
+    image_channels[image_order['HSV']] = cv2.cvtColor(resized_image, cv2.COLOR_BGR2HSV_FULL)
+    image_channels[image_order['LUV']] = cv2.cvtColor(resized_image, cv2.COLOR_BGR2LUV)
+    image_channels[image_order['RGB']] = cv2.cvtColor(resized_image, cv2.COLOR_BGR2RGB)
 
     # Color features are created for each color space separately
     features = [0] * len(image_order.keys())
@@ -141,16 +219,32 @@ def process_image(img_name, detection_file,  resizing=1):
         clustering_results[i], fileNames = generate_segments(features[i], imageOI, img_name, v, resizing)
 
         for i, result in enumerate(clustering_results[i]):
-            navigable_area = extract_navigable_areas(result, resizing, detection_file).astype("uint8")
+            navigable_mask = extract_navigable_areas(result, org_image, resizing, detection_file).astype("uint8")
 
             # Resize back to original size
-            navigable_area = cv2.resize(navigable_area, None, fx=1 / resizing, fy=1 / resizing,
+            navigable_mask = cv2.resize(navigable_mask, None, fx=1 / resizing, fy=1 / resizing,
                                         interpolation=cv2.INTER_LINEAR)
 
-            cv2.imshow(fileNames[i], navigable_area)
+            org_image = cv2.imread(img_name)
+            print("Writing to file {}".format(fileNames[i]))
+
+            #region navigable
+
+            cv2.imshow(fileNames[i] + img_name[img_name.rfind("."):], navigable_mask)
+            navigable_area = cv2.bitwise_and(src1=org_image,
+                                             src2=org_image,
+                                             dst=None,
+                                             mask = navigable_mask)
+            cv2.imshow(fileNames[i] + "_colored" + img_name[img_name.rfind("."):], navigable_area)
             cv2.waitKey(0)
+
             cv2.destroyAllWindows()
-            cv2.imwrite(fileNames[i], navigable_area)
+            cv2.imwrite(fileNames[i]  + img_name[img_name.rfind("."):] , navigable_mask)
+            cv2.imwrite(fileNames[i] + "_colored" + img_name[img_name.rfind("."):], navigable_area)
+
+            #endregion
+
+
 
 
 '''
@@ -167,13 +261,13 @@ to total number of frames, consider ones that are below the threshold as noise
 '''
 
 
-def extract_navigable_areas(segmented_img, resizing, pedest_loc):
+def extract_navigable_areas(segmented_img, original_img, resizing, pedest_loc):
     if debugging:
         # Canvas image is used to draw red circles on in order to debug the result better
         canvas_img = np.copy(segmented_img)
         canvas_img = cv2.cvtColor(canvas_img, cv2.COLOR_GRAY2BGR)
         cv2.imshow("Grayscale Segments", segmented_img)
-        cv2.waitKey(10)
+        cv2.waitKey(5)
 
     prev_frame = 0
     navigable_labels = []
@@ -192,7 +286,10 @@ def extract_navigable_areas(segmented_img, resizing, pedest_loc):
                 prev_frame = frame_index
 
             # Find the label value there, in order to add it to the navigable list
-            pixelValue = segmented_img[int(feet[1] * resizing)][int(feet[0] * resizing)]
+            try: #Some trackers might go over bounds
+                pixelValue = segmented_img[int(feet[1] * resizing)][int(feet[0] * resizing)]
+            except IndexError:
+                continue
 
             # Ignore noisy areas
             if not pixelValue == 0:
@@ -206,8 +303,10 @@ def extract_navigable_areas(segmented_img, resizing, pedest_loc):
     navigable_labels = list(zip(list(set(navigable_labels)), navigable_labels_freq[navigable_labels]))
 
     try:
-        # TODO: Detection per frame is used to filter number of navigations in the area
-        navigable_func = lambda x: x[1] / prev_frame > 0.1
+        print("All labels before filtering: {}".format(navigable_labels))
+        #Detection per frame is used to filter number of navigations in the area
+        # Parameter
+        navigable_func = lambda x: (float(x[1]) / prev_frame) > 0.8
         navigable_labels = list(zip(*list(filter(navigable_func, navigable_labels))))[0]
     except IndexError:
         navigable_labels = []
@@ -220,13 +319,6 @@ def extract_navigable_areas(segmented_img, resizing, pedest_loc):
     for label in navigable_labels:
         rows, cols = np.where(segmented_img == label)
         mask[rows, cols] = 255
-
-    # Apply dilation and erosion TODO: This step should be done after homography has been calculated
-    if False:
-        closing_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
-        opening_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        cv2.morphologyEx(mask, cv2.MORPH_CLOSE, closing_kernel, mask)
-        cv2.morphologyEx(mask, cv2.MORPH_OPEN, opening_kernel, mask)
 
     cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR, mask)
 
