@@ -10,15 +10,30 @@ from os.path import join
 # Code is similar to DeepLab's Demo code at:
 # https://colab.research.google.com/github/tensorflow/models/blob/master/research/deeplab/deeplab_demo.ipynb
 
+# Areas that are considered to be navigable:
+# If at least a single person is detected to be walking over that instance, it is considered navigable
+# 4 floor
+# 7 road, route
+# 10 grass
+# 12 pavement, sidewalk
+# 29 carpet (can be vertical)
+# 53 path
+# 55 runway
+# 92 dirt
+# 102 stage (can be vertical)
+#
+
 class SemanticNavigableAreaSegmenter(object):
 
     INPUT_TENSOR_NAME = 'ImageTensor:0'
-
-    #TODO: We may need another tensor output as it might contain instance information
     OUTPUT_TENSOR_NAME = 'SemanticPredictions:0'
-
     INPUT_SIZE = 513
+
     FROZEN_GRAPH_NAME = 'frozen_inference_graph'
+
+    # floor, road, grass, pavement, carpet, path, runway, dirt, stage
+    NAVIGABLE_REGIONS = [4, 7, 10, 12, 29, 53, 55, 92, 102]
+    NAVIGABLE_REGION_PERCENTAGE_THRESHOLD = 0.9
 
     #Load the frozen model weights
     def __init__(self, tarball_path):
@@ -47,6 +62,8 @@ class SemanticNavigableAreaSegmenter(object):
 
     '''
     The navigable areas extraction algorithm
+    -   Determine the navigable areas in the semantically segmented image. For example: wall is non-navigable but road is
+    -   Identify the instances of each label as they are going to be considered independently
     -   Create an empty list that will hold the navigable labels, where number of occurrences in it represents number
     of frames they are identified as navigable
     -   For every second (fps), read the frame
@@ -64,13 +81,54 @@ class SemanticNavigableAreaSegmenter(object):
         canvas_img = np.copy(segmented_img)
         canvas_img = cv2.cvtColor(canvas_img, cv2.COLOR_GRAY2BGR)
         cv2.imshow("Grayscale Segments", segmented_img)
-        cv2.waitKey(5)
+        cv2.waitKey(0)
 
         prev_frame = 0
         navigable_labels = []
 
+        # Only a certain classes are accepted as navigable and each cluster of regions are considered
+        # independently, any instance that is suppose to be navigable can be non-navigable if none of
+        # the pedestrians have navigated on it. This is applied to prevent any false positive navigable
+        # regions as much as possible. The cases where an obvious area is missed are acceptable when compared
+        # to flying pedestrians
+
+        # The image segments are labeled according to their navigability. If non-navigable, it is set to 0
+        # For each instance, a new label is assigned
+
         # Read the segmented image and check the labels that are within, to see if they are actually distinct
         # Other than what is seems on the resulting image
+
+        # region cluster_process
+
+        # After filtering the image, determine individual clusters using connected components approach
+
+        globalLabel = 0
+
+        label_list = np.unique(segmented_img)
+        new_labels = np.zeros_like(segmented_img)
+
+        #Filter non-navigable labels beforehand
+        label_list = np.intersect1d(label_list, self.NAVIGABLE_REGIONS)
+        non_navigables = np.where(segmented_img not in label_list)
+        segmented_img[non_navigables] = 0
+
+        for label in label_list:
+
+            # Obtain label contours
+            current_label_image = np.zeros_like(segmented_img)
+
+            rows, cols = np.where(segmented_img == label)
+            current_label_image[rows, cols] = 255
+
+            num_of_clusters, clusters = cv2.connectedComponents(current_label_image)
+
+            rows, cols = np.where(clusters != 0)
+            new_labels[rows, cols] = clusters[rows, cols] + globalLabel
+            globalLabel += np.max(clusters)
+
+        segmented_img = np.reshape(new_labels, segmented_img.shape).astype("uint8")
+        cv2.imshow("Instance labels", segmented_img)
+        cv2.waitKey(0)
 
         # Open the pedest_loc file and start parsing
         with open(pedest_loc) as pedestrians:
@@ -100,9 +158,8 @@ class SemanticNavigableAreaSegmenter(object):
 
         try:
             print("All labels before filtering: {}".format(navigable_labels))
-            #Detection per frame is used to filter number of navigations in the area
-            # Parameter
-            navigable_func = lambda x: (float(x[1]) / prev_frame) > 0.8
+            # Detection per frame is used to filter number of navigations in the area
+            navigable_func = lambda x: (float(x[1]) / prev_frame) > self.NAVIGABLE_REGION_PERCENTAGE_THRESHOLD
             navigable_labels = list(zip(*list(filter(navigable_func, navigable_labels))))[0]
         except IndexError:
             navigable_labels = []
@@ -126,6 +183,8 @@ class SemanticNavigableAreaSegmenter(object):
     def run(self, img_name, detection_file):
 
         base_image_name = os.path.basename(img_name)
+        image_folder = os.path.dirname(img_name)
+
         print("Processing image " + base_image_name)
         org_image = cv2.imread(img_name)
 
@@ -136,29 +195,25 @@ class SemanticNavigableAreaSegmenter(object):
                                                 (self.INPUT_SIZE, self.INPUT_SIZE), interpolation=cv2.INTER_LINEAR),
                                      cv2.COLOR_BGR2RGB)
 
-        # TODO: What about others (instances)?
         batch_seg_map = self.sess.run(
             self.OUTPUT_TENSOR_NAME,
             feed_dict={self.INPUT_TENSOR_NAME: [np.asarray(resized_image)]})
 
-        seg_map = batch_seg_map[0]
-        other_seg_map = batch_seg_map[0]
-
-        cv2.namedWindow("Segmentation Result")
-        cv2.imshow("Segmentation Result", seg_map.astype("uint8"))
-        cv2.waitKey(0)
+        seg_map = batch_seg_map[0].astype("uint8")
 
         # The output segmentation image needs to be resized
-        seg_map = cv2.resize(seg_map, org_image.shape[:2], interpolation=cv2.INTER_LINEAR)
+        seg_map = cv2.resize(seg_map, org_image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
+        print("Writing to: " + os.path.join(image_folder, "area_" + base_image_name))
+        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), seg_map)
 
         #endregion
 
-        #Result obtained and regions are identified using tensor output (instances)
-        #Appearently, the output must contain multiple levels of output. we shall test it
-
-        navigable_mask = self.extract_navigable_areas(seg_map, org_image, detection_file).astype("uint8")
+        #Navigable instances of regions are written as masks for mesh generation
 
         #region navigable
+
+        navigable_mask = self.extract_navigable_areas(seg_map, org_image, detection_file)
+
 
         cv2.imshow("Navigable mask " + base_image_name, navigable_mask)
         navigable_area = cv2.bitwise_and(src1=org_image,
@@ -169,8 +224,8 @@ class SemanticNavigableAreaSegmenter(object):
         cv2.waitKey(0)
 
         cv2.destroyAllWindows()
-        cv2.imwrite("mask_" + base_image_name, navigable_mask)
-        cv2.imwrite("area_" + base_image_name, navigable_area)
+        cv2.imwrite(os.path.join(image_folder, "mask_" + base_image_name), navigable_mask)
+        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), navigable_area)
 
 
 if __name__ == "__main__":
@@ -190,6 +245,8 @@ if __name__ == "__main__":
 
     #Create the network object instance
     segmenter = SemanticNavigableAreaSegmenter(args.network)
+
+    #args.image = ".\\test_images\\tf_test\\ade_label_test"
 
     try:
         # If image, directly call the method
