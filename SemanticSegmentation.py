@@ -7,10 +7,10 @@ import tarfile
 
 from os.path import join
 
-# Code is similar to DeepLab's Demo code at:
+# Code is based on DeepLab's Demo code at:
 # https://colab.research.google.com/github/tensorflow/models/blob/master/research/deeplab/deeplab_demo.ipynb
 
-# Areas that are considered to be navigable:
+# Areas that are considered to be navigable (Labels according to Xception network trained on ADE20K):
 # If at least a single person is detected to be walking over that instance, it is considered navigable
 # 4 floor
 # 7 road, route
@@ -21,22 +21,23 @@ from os.path import join
 # 55 runway
 # 92 dirt
 # 102 stage (can be vertical)
-#
 
 class SemanticNavigableAreaSegmenter(object):
 
     INPUT_TENSOR_NAME = 'ImageTensor:0'
     OUTPUT_TENSOR_NAME = 'SemanticPredictions:0'
-    INPUT_SIZE = 513
 
     FROZEN_GRAPH_NAME = 'frozen_inference_graph'
 
-    # floor, road, grass, pavement, carpet, path, runway, dirt, stage
+    # floor, road, grass, pavement, carpet, path, runway, dirt, stage, (person)
     NAVIGABLE_REGIONS = [4, 7, 10, 12, 29, 53, 55, 92, 102]
-    NAVIGABLE_REGION_PERCENTAGE_THRESHOLD = 0.9
 
     #Load the frozen model weights
-    def __init__(self, tarball_path):
+    #Directly taken from Deeplab's demo code
+    def __init__(self, tarball_path, input_size):
+
+        self.input_size = input_size
+
         """Creates and loads pretrained deeplab model."""
         self.graph = tf.Graph()
 
@@ -57,8 +58,55 @@ class SemanticNavigableAreaSegmenter(object):
         with self.graph.as_default():
             tf.import_graph_def(graph_def, name='')
 
+
         self.sess = tf.Session(graph=self.graph)
 
+    def run(self, img_name, detection_file, threshold):
+
+        base_image_name = os.path.basename(img_name)
+        image_folder = os.path.dirname(img_name)
+
+        print("Processing image " + base_image_name)
+        org_image = cv2.imread(img_name)
+
+        #region semantic segmentation
+
+        #The image needs to be resized  to match tensor input and color channels must be rearranged
+        resized_image = cv2.cvtColor(cv2.resize(org_image,
+                                                (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR),
+                                     cv2.COLOR_BGR2RGB)
+
+        batch_seg_map = self.sess.run(
+            self.OUTPUT_TENSOR_NAME,
+            feed_dict={self.INPUT_TENSOR_NAME: [np.asarray(resized_image)]})
+
+        seg_map = batch_seg_map[0].astype("uint8")
+
+        # The output segmentation image needs to be resized
+        seg_map = cv2.resize(seg_map, org_image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
+        print("Writing to: " + os.path.join(image_folder, "area_" + base_image_name))
+        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), seg_map)
+
+        #endregion
+
+        #Navigable instances of regions are written as masks for mesh generation
+
+        #region navigable
+
+        navigable_mask = self.extract_navigable_areas(seg_map, org_image, detection_file, threshold)
+
+
+        cv2.imshow("Navigable mask " + base_image_name, navigable_mask)
+        navigable_area = cv2.bitwise_and(src1=org_image,
+                                         src2=org_image,
+                                         dst=None,
+                                         mask=navigable_mask)
+        cv2.imshow("Navigable area " + base_image_name, navigable_area)
+        cv2.waitKey(0)
+
+        cv2.destroyAllWindows()
+        cv2.imwrite(os.path.join(image_folder, "mask_" + base_image_name), navigable_mask)
+        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), navigable_area)
 
     '''
     The navigable areas extraction algorithm
@@ -75,7 +123,7 @@ class SemanticNavigableAreaSegmenter(object):
     -   Apply the mask onto the segments to obtain final navigable areas as a binary image (as white)
     '''
 
-    def extract_navigable_areas(self, segmented_img, original_img, pedest_loc):
+    def extract_navigable_areas(self, segmented_img, original_img, pedest_loc, threshold):
 
         # Canvas image is used to draw red circles on in order to debug the result better
         canvas_img = np.copy(segmented_img)
@@ -130,6 +178,8 @@ class SemanticNavigableAreaSegmenter(object):
         cv2.imshow("Instance labels", segmented_img)
         cv2.waitKey(0)
 
+        #endregion
+
         # Open the pedest_loc file and start parsing
         with open(pedest_loc) as pedestrians:
             for i, line in enumerate(pedestrians):
@@ -158,8 +208,9 @@ class SemanticNavigableAreaSegmenter(object):
 
         try:
             print("All labels before filtering: {}".format(navigable_labels))
+            print("Applying the threshold {}".format(threshold))
             # Detection per frame is used to filter number of navigations in the area
-            navigable_func = lambda x: (float(x[1]) / prev_frame) > self.NAVIGABLE_REGION_PERCENTAGE_THRESHOLD
+            navigable_func = lambda x: (float(x[1]) / prev_frame) >= threshold
             navigable_labels = list(zip(*list(filter(navigable_func, navigable_labels))))[0]
         except IndexError:
             navigable_labels = []
@@ -180,53 +231,6 @@ class SemanticNavigableAreaSegmenter(object):
 
         return mask
 
-    def run(self, img_name, detection_file):
-
-        base_image_name = os.path.basename(img_name)
-        image_folder = os.path.dirname(img_name)
-
-        print("Processing image " + base_image_name)
-        org_image = cv2.imread(img_name)
-
-        #region semantic segmentation
-
-        #The image needs to be resized  to match tensor input and color channels must be rearranged
-        resized_image = cv2.cvtColor(cv2.resize(org_image,
-                                                (self.INPUT_SIZE, self.INPUT_SIZE), interpolation=cv2.INTER_LINEAR),
-                                     cv2.COLOR_BGR2RGB)
-
-        batch_seg_map = self.sess.run(
-            self.OUTPUT_TENSOR_NAME,
-            feed_dict={self.INPUT_TENSOR_NAME: [np.asarray(resized_image)]})
-
-        seg_map = batch_seg_map[0].astype("uint8")
-
-        # The output segmentation image needs to be resized
-        seg_map = cv2.resize(seg_map, org_image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
-        print("Writing to: " + os.path.join(image_folder, "area_" + base_image_name))
-        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), seg_map)
-
-        #endregion
-
-        #Navigable instances of regions are written as masks for mesh generation
-
-        #region navigable
-
-        navigable_mask = self.extract_navigable_areas(seg_map, org_image, detection_file)
-
-
-        cv2.imshow("Navigable mask " + base_image_name, navigable_mask)
-        navigable_area = cv2.bitwise_and(src1=org_image,
-                                         src2=org_image,
-                                         dst=None,
-                                         mask=navigable_mask)
-        cv2.imshow("Navigable area " + base_image_name, navigable_area)
-        cv2.waitKey(0)
-
-        cv2.destroyAllWindows()
-        cv2.imwrite(os.path.join(image_folder, "mask_" + base_image_name), navigable_mask)
-        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), navigable_area)
-
 
 if __name__ == "__main__":
 
@@ -237,21 +241,24 @@ if __name__ == "__main__":
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter
                                      )
     parser.add_argument('-i', '--image', help="Image file or folder to segment")
-    parser.add_argument('-t', '--network', help="Path to tarball which contains the frozen inference graph")
+    parser.add_argument('-n', '--network', help="Path to tarball which contains the frozen inference graph")
+    parser.add_argument('-s', '--size', help="Input size dimension (Size x Size)")
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
+    parser.add_argument('-t', '--threshold', help="Percentage of frames area should be navigated by at least one pedestrian",
+                        default=0.7)
     args = parser.parse_args()
 
     pedestrian_detection_data = args.ped_file
 
     #Create the network object instance
-    segmenter = SemanticNavigableAreaSegmenter(args.network)
+    segmenter = SemanticNavigableAreaSegmenter(args.network, int(args.size))
 
     #args.image = ".\\test_images\\tf_test\\ade_label_test"
 
     try:
         # If image, directly call the method
         if os.path.isfile(args.image):
-            segmenter.run(args.image, pedestrian_detection_data)
+            segmenter.run(args.image, pedestrian_detection_data, float(args.threshold))
         else:
             # If folder, call  the method for every image in it (only goes one level,
             # doesn't recursively search for images)
@@ -259,6 +266,6 @@ if __name__ == "__main__":
             file_list = [args.image + os.path.sep + file for file in os.listdir(args.image) if
                          os.path.isfile(join(args.image, file))]
             for image in file_list:
-                segmenter.run(image, pedestrian_detection_data)
+                segmenter.run(image, pedestrian_detection_data, float(args.threshold))
     except FileNotFoundError:
         print(args.image + " is not found. Ignoring...")
