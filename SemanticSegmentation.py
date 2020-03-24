@@ -1,11 +1,12 @@
 import os
+import tarfile
+from os.path import join
+
 import cv2
 import numpy as np
-
+import seaborn as sea
 import tensorflow as tf
-import tarfile
 
-from os.path import join
 
 # Code is based on DeepLab's Demo code at:
 # https://colab.research.google.com/github/tensorflow/models/blob/master/research/deeplab/deeplab_demo.ipynb
@@ -22,24 +23,35 @@ from os.path import join
 # 92 dirt
 # 102 stage (can be vertical)
 
-class SemanticNavigableAreaSegmenter(object):
-
+class NavigableAreaSegmentation:
+    # Names taken from Deeplab directly
     INPUT_TENSOR_NAME = 'ImageTensor:0'
     OUTPUT_TENSOR_NAME = 'SemanticPredictions:0'
 
     FROZEN_GRAPH_NAME = 'frozen_inference_graph'
 
-    # floor, road, grass, pavement, carpet, path, runway, dirt, stage, (person)
+    # floor, road, grass, pavement, carpet, path, runway, dirt, stage
     NAVIGABLE_REGIONS = [4, 7, 10, 12, 29, 53, 55, 92, 102]
 
-    #Load the frozen model weights
-    #Directly taken from Deeplab's demo code
+    # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
+    @staticmethod
+    def wrap_frozen_graph(graph_def, inputs, outputs):
+        def _imports_graph_def():
+            tf.compat.v1.import_graph_def(graph_def, name="")
+
+        wrapped_import = tf.compat.v1.wrap_function(_imports_graph_def, [])
+        import_graph = wrapped_import.graph
+        return wrapped_import.prune(
+            tf.nest.map_structure(import_graph.as_graph_element, inputs),
+            tf.nest.map_structure(import_graph.as_graph_element, outputs))
+
+    # Load the frozen model weights
+    # Directly taken from Deeplab's demo code
     def __init__(self, tarball_path, input_size):
 
         self.input_size = input_size
 
-        """Creates and loads pretrained deeplab model."""
-        self.graph = tf.Graph()
+        self.segmentation_func = None
 
         graph_def = None
         # Extract frozen graph from tar archive.
@@ -47,7 +59,8 @@ class SemanticNavigableAreaSegmenter(object):
         for tar_info in tar_file.getmembers():
             if self.FROZEN_GRAPH_NAME in os.path.basename(tar_info.name):
                 file_handle = tar_file.extractfile(tar_info)
-                graph_def = tf.GraphDef.FromString(file_handle.read())
+                graph_def = tf.compat.v1.GraphDef()
+                graph_def.ParseFromString(file_handle.read())
                 break
 
         tar_file.close()
@@ -55,11 +68,13 @@ class SemanticNavigableAreaSegmenter(object):
         if graph_def is None:
             raise RuntimeError('Cannot find inference graph in tar archive.')
 
-        with self.graph.as_default():
-            tf.import_graph_def(graph_def, name='')
-
-
-        self.sess = tf.Session(graph=self.graph)
+        # A usable concrete_function
+        self.segmentation_func = \
+            self.wrap_frozen_graph(
+                graph_def,
+                inputs=self.INPUT_TENSOR_NAME,
+                outputs=self.OUTPUT_TENSOR_NAME
+            )
 
     def run(self, img_name, detection_file, threshold):
 
@@ -69,32 +84,31 @@ class SemanticNavigableAreaSegmenter(object):
         print("Processing image " + base_image_name)
         org_image = cv2.imread(img_name)
 
-        #region semantic segmentation
+        # region semantic segmentation
 
-        #The image needs to be resized  to match tensor input and color channels must be rearranged
-        resized_image = cv2.cvtColor(cv2.resize(org_image,
-                                                (self.input_size, self.input_size), interpolation=cv2.INTER_LINEAR),
+        # The image needs to be resized to match tensor input and color channels must be rearranged
+        resized_image = cv2.cvtColor(cv2.resize(org_image, (self.input_size, self.input_size),
+                                                interpolation=cv2.INTER_LINEAR),
                                      cv2.COLOR_BGR2RGB)
 
-        batch_seg_map = self.sess.run(
-            self.OUTPUT_TENSOR_NAME,
-            feed_dict={self.INPUT_TENSOR_NAME: [np.asarray(resized_image)]})
+        # Convert the image to a tensor since concrete functions only work with tensors
+        input_tensor = tf.convert_to_tensor([np.asarray(resized_image)], dtype="uint8")
+        batch_seg_map = self.segmentation_func(input_tensor)
 
-        seg_map = batch_seg_map[0].astype("uint8")
+        seg_map = batch_seg_map[0].numpy().astype("uint8")
 
         # The output segmentation image needs to be resized
         seg_map = cv2.resize(seg_map, org_image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
         print("Writing to: " + os.path.join(image_folder, "area_" + base_image_name))
         cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), seg_map)
 
-        #endregion
+        # endregion
 
-        #Navigable instances of regions are written as masks for mesh generation
+        # Navigable instances of regions are written as masks for mesh generation
 
-        #region navigable
+        # region navigable
 
-        navigable_mask = self.extract_navigable_areas(seg_map, org_image, detection_file, threshold)
-
+        navigable_mask, colored_regions = self.extract_navigable_areas(seg_map, org_image, detection_file, threshold)
 
         cv2.imshow("Navigable mask " + base_image_name, navigable_mask)
         navigable_area = cv2.bitwise_and(src1=org_image,
@@ -107,6 +121,11 @@ class SemanticNavigableAreaSegmenter(object):
         cv2.destroyAllWindows()
         cv2.imwrite(os.path.join(image_folder, "mask_" + base_image_name), navigable_mask)
         cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), navigable_area)
+        cv2.imwrite(os.path.join(image_folder, "colored_" + base_image_name), colored_regions)
+
+    @staticmethod
+    def normalizeColor(color):
+        return [255 * channel for channel in color]
 
     '''
     The navigable areas extraction algorithm
@@ -155,13 +174,13 @@ class SemanticNavigableAreaSegmenter(object):
         label_list = np.unique(segmented_img)
         new_labels = np.zeros_like(segmented_img)
 
-        #Filter non-navigable labels beforehand
+        # Filter non-navigable labels beforehand
         label_list = np.intersect1d(label_list, self.NAVIGABLE_REGIONS)
         non_navigables = np.where(segmented_img not in label_list)
         segmented_img[non_navigables] = 0
 
+        # Determine label instances
         for label in label_list:
-
             # Obtain label contours
             current_label_image = np.zeros_like(segmented_img)
 
@@ -178,7 +197,15 @@ class SemanticNavigableAreaSegmenter(object):
         cv2.imshow("Instance labels", segmented_img)
         cv2.waitKey(0)
 
-        #endregion
+        palette = sea.color_palette('deep', np.unique(globalLabel).max() + 1)
+        colors = [self.normalizeColor(palette[x]) if x > 0 else (0.0, 0.0, 0.0) for x in
+                  new_labels.flatten()]
+
+        canvas_img = np.reshape(colors, canvas_img.shape).astype("uint8")
+
+        # cv2.destroyAllWindows()
+
+        # endregion
 
         # Open the pedest_loc file and start parsing
         with open(pedest_loc) as pedestrians:
@@ -191,7 +218,7 @@ class SemanticNavigableAreaSegmenter(object):
                     prev_frame = frame_index
 
                 # Find the label value there, in order to add it to the navigable list
-                try: #Some trackers might go over bounds
+                try:  # Some trackers might go over bounds
                     pixelValue = segmented_img[int(feet[1])][int(feet[0])]
                 except IndexError:
                     continue
@@ -200,8 +227,8 @@ class SemanticNavigableAreaSegmenter(object):
                 if not pixelValue == 0:
                     navigable_labels.append(pixelValue)
                     # Put a dot at the feetpos for debugging the detections' location
-                    cv2.circle(canvas_img, (int(feet[0]),int(feet[1])), 2,
-                               (0, 0, 255))
+                    cv2.circle(canvas_img, (int(feet[0]), int(feet[1])), 3,
+                               (255, 255, 255))
 
         navigable_labels_freq = np.bincount(navigable_labels)
         navigable_labels = list(zip(list(set(navigable_labels)), navigable_labels_freq[navigable_labels]))
@@ -229,36 +256,33 @@ class SemanticNavigableAreaSegmenter(object):
         cv2.imshow("Pedestrian Steps", canvas_img)
         cv2.waitKey(0)
 
-        return mask
+        return mask, canvas_img
 
 
 if __name__ == "__main__":
 
     import argparse
 
-    parser = argparse.ArgumentParser(description="Apply segmentation algortihms (DB, HDBSCAN, Meanshift) to the given image"
-                                                 "on different color formats (RGB, HSV, LAB, LUV)",
-                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter
-                                     )
-    parser.add_argument('-i', '--image', help="Image file or folder to segment")
+    parser = argparse.ArgumentParser(description="Apply deep learning based segmentation algorithms to the given image",
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
+    parser.add_argument('-i', '--image', help="Image file or folder of images to segment")
     parser.add_argument('-n', '--network', help="Path to tarball which contains the frozen inference graph")
     parser.add_argument('-s', '--size', help="Input size dimension (Size x Size)")
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
-    parser.add_argument('-t', '--threshold', help="Percentage of frames area should be navigated by at least one pedestrian",
-                        default=0.7)
+    parser.add_argument('-t', '--threshold', help="Threshold percentage of frames area should be navigated by at least "
+                                                  "one pedestrian", default=0.7)
     args = parser.parse_args()
 
     pedestrian_detection_data = args.ped_file
 
-    #Create the network object instance
-    segmenter = SemanticNavigableAreaSegmenter(args.network, int(args.size))
-
-    #args.image = ".\\test_images\\tf_test\\ade_label_test"
+    # Create the network object instance
+    segmentation = NavigableAreaSegmentation(args.network, int(args.size))
 
     try:
         # If image, directly call the method
         if os.path.isfile(args.image):
-            segmenter.run(args.image, pedestrian_detection_data, float(args.threshold))
+            segmentation.run(args.image, pedestrian_detection_data, float(args.threshold))
         else:
             # If folder, call  the method for every image in it (only goes one level,
             # doesn't recursively search for images)
@@ -266,6 +290,6 @@ if __name__ == "__main__":
             file_list = [args.image + os.path.sep + file for file in os.listdir(args.image) if
                          os.path.isfile(join(args.image, file))]
             for image in file_list:
-                segmenter.run(image, pedestrian_detection_data, float(args.threshold))
+                segmentation.run(image, pedestrian_detection_data, float(args.threshold))
     except FileNotFoundError:
         print(args.image + " is not found. Ignoring...")
