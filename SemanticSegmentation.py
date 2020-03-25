@@ -1,6 +1,5 @@
 import os
 import tarfile
-from os.path import join
 
 import cv2
 import numpy as np
@@ -31,7 +30,7 @@ class NavigableAreaSegmentation:
     FROZEN_GRAPH_NAME = 'frozen_inference_graph'
 
     # floor, road, grass, pavement, carpet, path, runway, dirt, stage
-    NAVIGABLE_REGIONS = [4, 7, 10, 12, 29, 53, 55, 92, 102]
+    NAVIGABLE_REGIONS = np.array([4, 7, 10, 12, 29, 53, 55, 92, 102])
 
     # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
     @staticmethod
@@ -142,13 +141,11 @@ class NavigableAreaSegmentation:
     -   Apply the mask onto the segments to obtain final navigable areas as a binary image (as white)
     '''
 
-    def extract_navigable_areas(self, segmented_img, original_img, pedest_loc, threshold):
+    def extract_navigable_areas(self, segmented_img, pedest_loc, threshold):
 
         # Canvas image is used to draw red circles on in order to debug the result better
         canvas_img = np.copy(segmented_img)
         canvas_img = cv2.cvtColor(canvas_img, cv2.COLOR_GRAY2BGR)
-        cv2.imshow("Grayscale Segments", segmented_img)
-        cv2.waitKey(0)
 
         prev_frame = 0
         navigable_labels = []
@@ -169,15 +166,11 @@ class NavigableAreaSegmentation:
 
         # After filtering the image, determine individual clusters using connected components approach
 
-        globalLabel = 0
+        global_label = 0
 
         label_list = np.unique(segmented_img)
+        label_list = label_list[label_list > 0]
         new_labels = np.zeros_like(segmented_img)
-
-        # Filter non-navigable labels beforehand
-        label_list = np.intersect1d(label_list, self.NAVIGABLE_REGIONS)
-        non_navigables = np.where(segmented_img not in label_list)
-        segmented_img[non_navigables] = 0
 
         # Determine label instances
         for label in label_list:
@@ -189,16 +182,15 @@ class NavigableAreaSegmentation:
 
             num_of_clusters, clusters = cv2.connectedComponents(current_label_image)
 
-            rows, cols = np.where(clusters != 0)
-            new_labels[rows, cols] = clusters[rows, cols] + globalLabel
-            globalLabel += np.max(clusters)
+            new_labels[rows, cols] = clusters[rows, cols] + global_label
+            global_label += np.max(clusters)
 
         segmented_img = np.reshape(new_labels, segmented_img.shape).astype("uint8")
         cv2.imshow("Instance labels", segmented_img)
         cv2.waitKey(0)
 
-        palette = sea.color_palette('deep', np.unique(globalLabel).max() + 1)
-        colors = [self.normalizeColor(palette[x]) if x > 0 else (0.0, 0.0, 0.0) for x in
+        palette = sea.color_palette('deep', np.unique(global_label).max() + 1)
+        colors = [self.normalize_color(palette[x]) if x > 0 else (0.0, 0.0, 0.0) for x in
                   new_labels.flatten()]
 
         canvas_img = np.reshape(colors, canvas_img.shape).astype("uint8")
@@ -207,7 +199,7 @@ class NavigableAreaSegmentation:
 
         # endregion
 
-        # Open the pedest_loc file and start parsing
+        # Open the pedestrian locations file and parse it
         with open(pedest_loc) as pedestrians:
             for i, line in enumerate(pedestrians):
                 locations = line.split(',')
@@ -219,14 +211,14 @@ class NavigableAreaSegmentation:
 
                 # Find the label value there, in order to add it to the navigable list
                 try:  # Some trackers might go over bounds
-                    pixelValue = segmented_img[int(feet[1])][int(feet[0])]
+                    pixel_value = segmented_img[int(feet[1])][int(feet[0])]
                 except IndexError:
                     continue
 
                 # Ignore noisy areas
-                if not pixelValue == 0:
-                    navigable_labels.append(pixelValue)
-                    # Put a dot at the feetpos for debugging the detections' location
+                if not pixel_value == 0:
+                    navigable_labels.append(pixel_value)
+                    # Put a dot at the feet position for debugging the detections' location
                     cv2.circle(canvas_img, (int(feet[0]), int(feet[1])), 3,
                                (255, 255, 255))
 
@@ -246,15 +238,13 @@ class NavigableAreaSegmentation:
         print("Navigable labels: {}".format(navigable_labels))
 
         # In the end, create our mask and multiply it with segmentation result
-        mask = np.zeros(segmented_img.shape, dtype="uint8")
-        for label in navigable_labels:
-            rows, cols = np.where(segmented_img == label)
-            mask[rows, cols] = 255
-
-        cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR, mask)
+        mask = np.where(np.isin(segmented_img, navigable_labels),
+                        255, 0).astype("uint8")
 
         cv2.imshow("Pedestrian Steps", canvas_img)
         cv2.waitKey(0)
+
+        cv2.destroyAllWindows()
 
         return mask, canvas_img
 
@@ -272,6 +262,12 @@ if __name__ == "__main__":
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
     parser.add_argument('-t', '--threshold', help="Threshold percentage of frames area should be navigated by at least "
                                                   "one pedestrian", default=0.7)
+    parser.add_argument('-g', '--ground_truth', help="Give ground truth segmentation for dice index calculation",
+                        default=None)
+    parser.add_argument('--display_results', help="Display results", const=True,
+                        default=False, nargs='?')
+    parser.add_argument('--save_results', help="Save results", const=True,
+                        default=False, nargs='?')
     args = parser.parse_args()
 
     pedestrian_detection_data = args.ped_file

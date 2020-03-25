@@ -57,10 +57,6 @@ def generate_features(imageOI):
 
     features = normalize(features, axis = 0, norm="max")
 
-    features[:, 0:2] = features[:, 0:2]
-    features[:, 2:] = 2 * features[:, 2:]
-
-
     return features
 
 
@@ -216,7 +212,7 @@ def process_image(img_name, detection_file,  resizing=1):
         imageOI = image_channels[i]
 
         features[i] = generate_features(imageOI)
-        clustering_results[i], fileNames = generate_segments(features[i], imageOI, img_name, v, resizing)
+        clustering_results[i], fileNames = generate_segments(features[i], imageOI, img_name, v)
 
         for i, result in enumerate(clustering_results[i]):
             navigable_mask = extract_navigable_areas(result, org_image, resizing, detection_file).astype("uint8")
