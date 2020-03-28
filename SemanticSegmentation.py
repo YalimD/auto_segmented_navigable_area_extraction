@@ -23,14 +23,11 @@ import tensorflow as tf
 # 102 stage (can be vertical)
 
 class NavigableAreaSegmentation:
-    # Names taken from Deeplab directly
-    INPUT_TENSOR_NAME = 'ImageTensor:0'
-    OUTPUT_TENSOR_NAME = 'SemanticPredictions:0'
-
-    FROZEN_GRAPH_NAME = 'frozen_inference_graph'
-
-    # floor, road, grass, pavement, carpet, path, runway, dirt, stage
+    # ADE20K: floor, road, grass, pavement, carpet, path, runway, dirt, stage
     NAVIGABLE_REGIONS = np.array([4, 7, 10, 12, 29, 53, 55, 92, 102])
+
+    # Cityscapes: ground, road, sidewalk, parking, terrain
+    # NAVIGABLE_REGIONS = np.array([6, 7, 8, 9, 22])
 
     # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
     @staticmethod
@@ -75,13 +72,7 @@ class NavigableAreaSegmentation:
                 outputs=self.OUTPUT_TENSOR_NAME
             )
 
-    def run(self, img_name, detection_file, threshold):
-
-        base_image_name = os.path.basename(img_name)
-        image_folder = os.path.dirname(img_name)
-
-        print("Processing image " + base_image_name)
-        org_image = cv2.imread(img_name)
+    def determine_segments(self, image):
 
         # region semantic segmentation
 
@@ -261,7 +252,9 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--size', help="Input size dimension (Size x Size)")
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
     parser.add_argument('-t', '--threshold', help="Threshold percentage of frames area should be navigated by at least "
-                                                  "one pedestrian", default=0.7)
+                                                  "one pedestrian", type=float, default=0.7)
+    parser.add_argument('-u', '--frames_per_update', help="Segmentation update frequency (unused for image)",
+                        type=int, default=30)
     parser.add_argument('-g', '--ground_truth', help="Give ground truth segmentation for dice index calculation",
                         default=None)
     parser.add_argument('--display_results', help="Display results", const=True,
