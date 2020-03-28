@@ -22,27 +22,31 @@ import tensorflow as tf
 # 92 dirt
 # 102 stage (can be vertical)
 
+class VideoReader:
+    def __init__(self, source):
+        self.source = source
+
+    def __enter__(self):
+        self.video_capture = cv2.VideoCapture(self.source)
+
+        if not self.video_capture.isOpened():
+            raise IOError('Cannot open video file')
+
+        return self.video_capture
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.video_capture.release()
+
+
 class NavigableAreaSegmentation:
     # ADE20K: floor, road, grass, pavement, carpet, path, runway, dirt, stage
-    NAVIGABLE_REGIONS = np.array([4, 7, 10, 12, 29, 53, 55, 92, 102])
+    # NAVIGABLE_REGIONS = np.array([4, 7, 10, 12, 29, 53, 55, 92, 102])
 
-    # Cityscapes: ground, road, sidewalk, parking, terrain
-    # NAVIGABLE_REGIONS = np.array([6, 7, 8, 9, 22])
+    # Cityscapes: road, sidewalk, terrain
+    NAVIGABLE_REGIONS = np.array([0, 1, 9])
 
-    # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
-    @staticmethod
-    def wrap_frozen_graph(graph_def, inputs, outputs):
-        def _imports_graph_def():
-            tf.compat.v1.import_graph_def(graph_def, name="")
-
-        wrapped_import = tf.compat.v1.wrap_function(_imports_graph_def, [])
-        import_graph = wrapped_import.graph
-        return wrapped_import.prune(
-            tf.nest.map_structure(import_graph.as_graph_element, inputs),
-            tf.nest.map_structure(import_graph.as_graph_element, outputs))
-
-    # Load the frozen model weights
-    # Directly taken from Deeplab's demo code
+    # Load the frozen model
+    # Mostly taken from Deeplab's demo code (which is currently compatible with TF1)
     def __init__(self, tarball_path, input_size):
 
         self.input_size = input_size
@@ -53,7 +57,7 @@ class NavigableAreaSegmentation:
         # Extract frozen graph from tar archive.
         tar_file = tarfile.open(tarball_path)
         for tar_info in tar_file.getmembers():
-            if self.FROZEN_GRAPH_NAME in os.path.basename(tar_info.name):
+            if 'frozen_inference_graph' in os.path.basename(tar_info.name):
                 file_handle = tar_file.extractfile(tar_info)
                 graph_def = tf.compat.v1.GraphDef()
                 graph_def.ParseFromString(file_handle.read())
@@ -68,16 +72,18 @@ class NavigableAreaSegmentation:
         self.segmentation_func = \
             self.wrap_frozen_graph(
                 graph_def,
-                inputs=self.INPUT_TENSOR_NAME,
-                outputs=self.OUTPUT_TENSOR_NAME
+                inputs='ImageTensor:0',
+                outputs='SemanticPredictions:0'
             )
+
+        self.NAVIGABLE_REGIONS = self.NAVIGABLE_REGIONS + 1
 
     def determine_segments(self, image):
 
         # region semantic segmentation
 
         # The image needs to be resized to match tensor input and color channels must be rearranged
-        resized_image = cv2.cvtColor(cv2.resize(org_image, (self.input_size, self.input_size),
+        resized_image = cv2.cvtColor(cv2.resize(image, (self.input_size, self.input_size),
                                                 interpolation=cv2.INTER_LINEAR),
                                      cv2.COLOR_BGR2RGB)
 
@@ -85,41 +91,124 @@ class NavigableAreaSegmentation:
         input_tensor = tf.convert_to_tensor([np.asarray(resized_image)], dtype="uint8")
         batch_seg_map = self.segmentation_func(input_tensor)
 
-        seg_map = batch_seg_map[0].numpy().astype("uint8")
+        segmented_image = batch_seg_map[0].numpy().astype("uint8") + 1
 
         # The output segmentation image needs to be resized
-        seg_map = cv2.resize(seg_map, org_image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
-        print("Writing to: " + os.path.join(image_folder, "area_" + base_image_name))
-        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), seg_map)
+        segmented_image = cv2.resize(segmented_image, image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
 
         # endregion
 
-        # Navigable instances of regions are written as masks for mesh generation
+        return segmented_image
 
-        # region navigable
+    def iterate_video_frames(self, video_name, frames_per_update, show_result=False):
 
-        navigable_mask, colored_regions = self.extract_navigable_areas(seg_map, org_image, detection_file, threshold)
+        with VideoReader(video_name) as reader:
 
-        cv2.imshow("Navigable mask " + base_image_name, navigable_mask)
-        navigable_area = cv2.bitwise_and(src1=org_image,
-                                         src2=org_image,
+            navigable_labels = None
+            initial_frame = None
+            current_frame_no = -1
+
+            while True:
+                success, frame = reader.read()
+
+                if not success:
+                    break
+
+                current_frame_no += 1
+
+                if current_frame_no % frames_per_update > 0:
+                    continue
+                else:
+                    print("Updating segments at frame {}".format(current_frame_no))
+
+                if navigable_labels is None:
+                    navigable_labels = np.zeros(frame.shape[:-1], dtype="uint8")
+                    initial_frame = np.copy(frame)
+
+                segmented_frame = self.determine_segments(frame)
+
+                # Filter predefined non-navigable labels and update the mask
+                navigable_labels = np.where(np.isin(segmented_frame, self.NAVIGABLE_REGIONS),
+                                            segmented_frame, navigable_labels)
+
+                if show_result:
+                    navigable_area = cv2.bitwise_and(src1=frame,
+                                                     src2=frame,
+                                                     mask=navigable_labels)
+
+                    unified_view = np.concatenate((navigable_area, cv2.cvtColor(navigable_labels, cv2.COLOR_GRAY2BGR)),
+                                                  axis=1)
+
+                    cv2.imshow("Current navigable area", unified_view)
+                    cv2.waitKey(1)
+
+        return navigable_labels, initial_frame
+
+    def process_image(self, image_name, detection_file, threshold,
+                      ground_truth=None, show_result=False, save_results=False):
+
+        image = cv2.imread(image_name)
+
+        segmented_image = self.determine_segments(image)
+
+        navigable_labels = np.zeros(image.shape[:-1], dtype="uint8")
+        navigable_labels = np.where(np.isin(segmented_image, self.NAVIGABLE_REGIONS),
+                                    segmented_image, navigable_labels)
+
+        navigable_mask, colored_debug_image = self.extract_navigable_areas(navigable_labels,
+                                                                           detection_file, threshold)
+
+        cv2.cvtColor(navigable_mask, cv2.COLOR_GRAY2BGR, navigable_mask)
+
+        navigable_area = cv2.bitwise_and(src1=image,
+                                         src2=image,
                                          dst=None,
                                          mask=navigable_mask)
-        cv2.imshow("Navigable area " + base_image_name, navigable_area)
-        cv2.waitKey(0)
 
-        cv2.destroyAllWindows()
-        cv2.imwrite(os.path.join(image_folder, "mask_" + base_image_name), navigable_mask)
-        cv2.imwrite(os.path.join(image_folder, "area_" + base_image_name), navigable_area)
-        cv2.imwrite(os.path.join(image_folder, "colored_" + base_image_name), colored_regions)
+        if show_result:
+            unified_view = np.concatenate((navigable_area, navigable_mask),
+                                          axis=1)
 
-    @staticmethod
-    def normalizeColor(color):
-        return [255 * channel for channel in color]
+            cv2.imshow("Current navigable area", unified_view)
+            cv2.waitKey(0)
+
+        if save_results:
+            self.output_results(image_name, navigable_mask, navigable_labels, navigable_area, colored_debug_image)
+
+        if ground_truth:
+            gt_image = cv2.imread(ground_truth, 0)
+            self.assess_segmentation(navigable_mask, gt_image)
+
+        return navigable_mask, navigable_labels, navigable_area, colored_debug_image
+
+    def process_video(self, video_name, detection_file, threshold, frames_per_update=1,
+                      ground_truth=None, show_result=False, save_results=False):
+
+        # For each frame, determine segments, filter out non-navigable regions and update for each frame
+        # after the video is processed, for each region, use pedestrian data to determine its navigability
+        navigable_labels, initial_frame = self.iterate_video_frames(video_name, frames_per_update, show_result)
+
+        navigable_mask, colored_debug_image = self.extract_navigable_areas(navigable_labels,
+                                                                           detection_file, threshold)
+
+        cv2.cvtColor(navigable_mask, cv2.COLOR_GRAY2BGR, navigable_mask)
+
+        navigable_area = cv2.bitwise_and(src1=initial_frame,
+                                         src2=initial_frame,
+                                         dst=None,
+                                         mask=navigable_mask)
+        if save_results:
+            self.output_results(video_name, navigable_mask, navigable_labels, navigable_area, colored_debug_image)
+
+        if ground_truth:
+            gt_image = cv2.imread(ground_truth, 0)
+            self.assess_segmentation(navigable_mask, gt_image)
+
+        return navigable_mask, navigable_labels, navigable_area, colored_debug_image
 
     '''
     The navigable areas extraction algorithm
-    -   Determine the navigable areas in the semantically segmented image. For example: wall is non-navigable but road is
+    -   Get filtered, potential navigable areas image. 
     -   Identify the instances of each label as they are going to be considered independently
     -   Create an empty list that will hold the navigable labels, where number of occurrences in it represents number
     of frames they are identified as navigable
@@ -186,8 +275,6 @@ class NavigableAreaSegmentation:
 
         canvas_img = np.reshape(colors, canvas_img.shape).astype("uint8")
 
-        # cv2.destroyAllWindows()
-
         # endregion
 
         # Open the pedestrian locations file and parse it
@@ -239,6 +326,55 @@ class NavigableAreaSegmentation:
 
         return mask, canvas_img
 
+    # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
+    @staticmethod
+    def wrap_frozen_graph(graph_def, inputs, outputs):
+        def _imports_graph_def():
+            tf.compat.v1.import_graph_def(graph_def, name="")
+
+        wrapped_import = tf.compat.v1.wrap_function(_imports_graph_def, [])
+        import_graph = wrapped_import.graph
+        return wrapped_import.prune(
+            tf.nest.map_structure(import_graph.as_graph_element, inputs),
+            tf.nest.map_structure(import_graph.as_graph_element, outputs))
+
+    @staticmethod
+    def normalize_color(color):
+        return [255 * channel for channel in color]
+
+    @staticmethod
+    def assess_segmentation(segmented_img, ground_truth):
+
+        # determine number of positives in segmented
+        num_of_navigable_segmented = cv2.countNonZero(segmented_img)
+        num_of_navigable_gt = cv2.countNonZero(ground_truth)
+
+        # and the images and calculate number of true elements
+        img_and = cv2.bitwise_and(segmented_img, ground_truth)
+        tp = cv2.countNonZero(img_and)
+
+        fp = num_of_navigable_segmented - tp
+        fn = num_of_navigable_gt - tp
+
+        dice = (2 * tp) / (tp + fp + tp + fn)
+        print("Dice index: {}".format(dice))
+
+        return dice
+
+    @staticmethod
+    def output_results(file_name, navigable_mask, navigable_labels, navigable_area, colored_debug_image):
+
+        # Navigable instances of regions are written as masks for mesh generation
+        output_folder = os.path.dirname(file_name)
+        output_filename = os.path.splitext(os.path.basename(file_name))[0] + ".png"
+
+        print("Writing results to {}".format(output_folder))
+
+        cv2.imwrite(os.path.join(output_folder, "mask_" + output_filename), navigable_mask)
+        cv2.imwrite(os.path.join(output_folder, "labels_" + output_filename), navigable_labels)
+        cv2.imwrite(os.path.join(output_folder, "area_" + output_filename), navigable_area)
+        cv2.imwrite(os.path.join(output_folder, "colored_" + output_filename), colored_debug_image)
+
 
 if __name__ == "__main__":
 
@@ -247,7 +383,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Apply deep learning based segmentation algorithms to the given image",
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-    parser.add_argument('-i', '--image', help="Image file or folder of images to segment")
+    parser.add_argument('-v', '--video', help="Video to segment iteratively", default=None)
+    parser.add_argument('-i', '--image', help="Image file to segment, ignored if video is given", default=None)
     parser.add_argument('-n', '--network', help="Path to tarball which contains the frozen inference graph")
     parser.add_argument('-s', '--size', help="Input size dimension (Size x Size)")
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
@@ -269,16 +406,19 @@ if __name__ == "__main__":
     segmentation = NavigableAreaSegmentation(args.network, int(args.size))
 
     try:
-        # If image, directly call the method
-        if os.path.isfile(args.image):
-            segmentation.run(args.image, pedestrian_detection_data, float(args.threshold))
+        # If video, run the network for each frame and combine the results
+        if args.video and os.path.exists(args.video):
+            segmentation.process_video(args.video, pedestrian_detection_data, args.threshold,
+                                       args.frames_per_update,
+                                       args.ground_truth, show_result=args.display_results,
+                                       save_results=args.save_results)
+        elif args.image and os.path.exists(args.image):
+            # If image, directly process it
+            segmentation.process_image(args.image, pedestrian_detection_data, args.threshold, args.ground_truth,
+                                       show_result=args.display_results, save_results=args.save_results)
+
         else:
-            # If folder, call  the method for every image in it (only goes one level,
-            # doesn't recursively search for images)
-            print("Processing folder " + args.image)
-            file_list = [args.image + os.path.sep + file for file in os.listdir(args.image) if
-                         os.path.isfile(join(args.image, file))]
-            for image in file_list:
-                segmentation.run(image, pedestrian_detection_data, float(args.threshold))
+            print("No media is provided, exiting...")
+
     except FileNotFoundError:
-        print(args.image + " is not found. Ignoring...")
+        print("File is not found. Ignoring...")
