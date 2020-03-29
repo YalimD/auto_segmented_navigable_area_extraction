@@ -6,6 +6,7 @@ import numpy as np
 import seaborn as sea
 import tensorflow as tf
 
+from shadow_remover.shadow_remover import *
 
 # Code is based on DeepLab's Demo code at:
 # https://colab.research.google.com/github/tensorflow/models/blob/master/research/deeplab/deeplab_demo.ipynb
@@ -50,7 +51,7 @@ class NavigableAreaSegmentation:
 
     # Load the frozen model
     # Mostly taken from Deeplab's demo code (which is currently compatible with TF1)
-    def __init__(self, tarball_path, input_size, labels, dataset="ADE20K"):
+    def __init__(self, tarball_path, input_size, labels, dataset="ADE20K", remove_shadows=False):
 
         self.input_size = input_size
 
@@ -90,9 +91,12 @@ class NavigableAreaSegmentation:
 
         self.NAVIGABLE_REGIONS += 1
 
+        self.remove_shadows = remove_shadows
+
     def determine_segments(self, image):
 
-        # region semantic segmentation
+        if self.remove_shadows:
+            image = ShadowRemover.remove_shadows(image)
 
         # The image needs to be resized to match tensor input and color channels must be rearranged
         resized_image = cv2.cvtColor(cv2.resize(image, (self.input_size, self.input_size),
@@ -107,8 +111,6 @@ class NavigableAreaSegmentation:
 
         # The output segmentation image needs to be resized
         segmented_image = cv2.resize(segmented_image, image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
-
-        # endregion
 
         return segmented_image
 
@@ -409,6 +411,8 @@ if __name__ == "__main__":
                         type=int, default=30)
     parser.add_argument('-g', '--ground_truth', help="Give ground truth segmentation for dice index calculation",
                         default=None)
+    parser.add_argument('--remove_shadows', help="Remove shadows from frames/images to be processed", const=True,
+                        default=False, nargs='?')
     parser.add_argument('--display_results', help="Display results", const=True,
                         default=False, nargs='?')
     parser.add_argument('--save_results', help="Save results", const=True,
@@ -418,7 +422,8 @@ if __name__ == "__main__":
     pedestrian_detection_data = args.ped_file
 
     # Create the network object instance
-    segmentation = NavigableAreaSegmentation(args.network, int(args.size), args.labels, args.dataset)
+    segmentation = NavigableAreaSegmentation(args.network, int(args.size), args.labels, args.dataset,
+                                             args.remove_shadows)
 
     try:
         # If video, run the network for each frame and combine the results

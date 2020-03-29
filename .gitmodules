@@ -1,0 +1,3 @@
+[submodule "shadow_remover"]
+	path = shadow_remover
+	url = https://github.com/YalimD/image_shadow_remover.git
