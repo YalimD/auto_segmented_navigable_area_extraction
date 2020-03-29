@@ -39,15 +39,18 @@ class VideoReader:
 
 
 class NavigableAreaSegmentation:
-    # ADE20K: floor, road, grass, pavement, carpet, path, runway, dirt, stage
-    # NAVIGABLE_REGIONS = np.array([4, 7, 10, 12, 29, 53, 55, 92, 102])
+    NAVIGABLE_REGION_LABELS = {
+        # ADE20K: floor, road, grass, pavement, carpet, path, runway, dirt, stage
+        "ADE20K": np.array([4, 7, 10, 12, 29, 53, 55, 92, 102]),
+        # Cityscapes: road, sidewalk, terrain
+        "CITYSCAPES": np.array([0, 1, 9])
+    }
 
-    # Cityscapes: road, sidewalk, terrain
-    NAVIGABLE_REGIONS = np.array([0, 1, 9])
+    NAVIGABLE_REGIONS = np.array([])
 
     # Load the frozen model
     # Mostly taken from Deeplab's demo code (which is currently compatible with TF1)
-    def __init__(self, tarball_path, input_size):
+    def __init__(self, tarball_path, input_size, labels, dataset="ADE20K"):
 
         self.input_size = input_size
 
@@ -76,7 +79,16 @@ class NavigableAreaSegmentation:
                 outputs='SemanticPredictions:0'
             )
 
-        self.NAVIGABLE_REGIONS = self.NAVIGABLE_REGIONS + 1
+        if labels and len(labels) > 0:
+            self.NAVIGABLE_REGIONS = np.array(labels)
+
+        else:
+            try:
+                self.NAVIGABLE_REGIONS = self.NAVIGABLE_REGION_LABELS[dataset.upper()]
+            except KeyError:
+                self.NAVIGABLE_REGIONS = self.NAVIGABLE_REGION_LABELS["ADE20K"]
+
+        self.NAVIGABLE_REGIONS += 1
 
     def determine_segments(self, image):
 
@@ -386,6 +398,9 @@ if __name__ == "__main__":
     parser.add_argument('-v', '--video', help="Video to segment iteratively", default=None)
     parser.add_argument('-i', '--image', help="Image file to segment, ignored if video is given", default=None)
     parser.add_argument('-n', '--network', help="Path to tarball which contains the frozen inference graph")
+    parser.add_argument('-l', '--labels', help="Navigable labels (integers)", nargs='+', type=int)
+    parser.add_argument('-d', '--dataset', help="Dataset name for predefined labels (unused if labels are given)",
+                        type=str)
     parser.add_argument('-s', '--size', help="Input size dimension (Size x Size)")
     parser.add_argument('-f', '--ped_file', help="Detection file used for determining navigable areas")
     parser.add_argument('-t', '--threshold', help="Threshold percentage of frames area should be navigated by at least "
@@ -403,7 +418,7 @@ if __name__ == "__main__":
     pedestrian_detection_data = args.ped_file
 
     # Create the network object instance
-    segmentation = NavigableAreaSegmentation(args.network, int(args.size))
+    segmentation = NavigableAreaSegmentation(args.network, int(args.size), args.labels, args.dataset)
 
     try:
         # If video, run the network for each frame and combine the results
