@@ -2,11 +2,11 @@ import os
 import tarfile
 
 import cv2
-import numpy as np
 import seaborn as sea
 import tensorflow as tf
 
 from shadow_remover.shadow_remover import *
+
 
 # Code is based on DeepLab's Demo code at:
 # https://colab.research.google.com/github/tensorflow/models/blob/master/research/deeplab/deeplab_demo.ipynb
@@ -116,6 +116,8 @@ class NavigableAreaSegmentation:
 
     def iterate_video_frames(self, video_name, frames_per_update, show_result=False):
 
+        num_of_frames_processed = 0
+
         with VideoReader(video_name) as reader:
 
             navigable_labels = None
@@ -134,6 +136,7 @@ class NavigableAreaSegmentation:
                     continue
                 else:
                     print("Updating segments at frame {}".format(current_frame_no))
+                    num_of_frames_processed += 1
 
                 if navigable_labels is None:
                     navigable_labels = np.zeros(frame.shape[:-1], dtype="uint8")
@@ -156,7 +159,9 @@ class NavigableAreaSegmentation:
                     cv2.imshow("Current navigable area", unified_view)
                     cv2.waitKey(1)
 
-        return navigable_labels, initial_frame
+        print("Total number of frames from video processed {}".format(num_of_frames_processed))
+
+        return navigable_labels, initial_frame, num_of_frames_processed
 
     def process_image(self, image_name, detection_file, threshold,
                       ground_truth=None, show_result=False, save_results=False):
@@ -169,8 +174,8 @@ class NavigableAreaSegmentation:
         navigable_labels = np.where(np.isin(segmented_image, self.NAVIGABLE_REGIONS),
                                     segmented_image, navigable_labels)
 
-        navigable_mask, colored_debug_image = self.extract_navigable_areas(navigable_labels,
-                                                                           detection_file, threshold)
+        navigable_mask, colored_debug_image, proc_data = self.extract_navigable_areas(navigable_labels,
+                                                                           detection_file, threshold, show_result)
 
         cv2.cvtColor(navigable_mask, cv2.COLOR_GRAY2BGR, navigable_mask)
 
@@ -179,31 +184,37 @@ class NavigableAreaSegmentation:
                                          dst=None,
                                          mask=navigable_mask)
 
-        if show_result:
-            unified_view = np.concatenate((navigable_area, navigable_mask),
-                                          axis=1)
-
-            cv2.imshow("Current navigable area", unified_view)
-            cv2.waitKey(0)
+        # if show_result:
+        #     unified_view = np.concatenate((navigable_area, navigable_mask),
+        #                                   axis=1)
+        #
+        #     cv2.imshow("Current navigable area", unified_view)
+        #     cv2.waitKey(0)
 
         if save_results:
             self.output_results(image_name, navigable_mask, navigable_labels, navigable_area, colored_debug_image)
 
+        dice = 0
+
         if ground_truth:
             gt_image = cv2.imread(ground_truth, 0)
-            self.assess_segmentation(navigable_mask, gt_image)
+            dice = self.assess_segmentation(navigable_mask, gt_image)
 
-        return navigable_mask, navigable_labels, navigable_area, colored_debug_image
+        return navigable_mask, navigable_labels, navigable_area, colored_debug_image, \
+               proc_data, dice
 
     def process_video(self, video_name, detection_file, threshold, frames_per_update=1,
                       ground_truth=None, show_result=False, save_results=False):
 
         # For each frame, determine segments, filter out non-navigable regions and update for each frame
         # after the video is processed, for each region, use pedestrian data to determine its navigability
-        navigable_labels, initial_frame = self.iterate_video_frames(video_name, frames_per_update, show_result)
+        navigable_labels, initial_frame, num_of_frames_processed = self.iterate_video_frames(video_name,
+                                                                                             frames_per_update,
+                                                                                             show_result)
 
-        navigable_mask, colored_debug_image = self.extract_navigable_areas(navigable_labels,
-                                                                           detection_file, threshold)
+        navigable_mask, colored_debug_image, proc_data = self.extract_navigable_areas(navigable_labels,
+                                                                                      detection_file, threshold,
+                                                                                      show_result)
 
         cv2.cvtColor(navigable_mask, cv2.COLOR_GRAY2BGR, navigable_mask)
 
@@ -214,11 +225,14 @@ class NavigableAreaSegmentation:
         if save_results:
             self.output_results(video_name, navigable_mask, navigable_labels, navigable_area, colored_debug_image)
 
+        dice = 0
+
         if ground_truth:
             gt_image = cv2.imread(ground_truth, 0)
-            self.assess_segmentation(navigable_mask, gt_image)
+            dice = self.assess_segmentation(navigable_mask, gt_image)
 
-        return navigable_mask, navigable_labels, navigable_area, colored_debug_image
+        return navigable_mask, navigable_labels, navigable_area, colored_debug_image, \
+               num_of_frames_processed, proc_data, dice
 
     '''
     The navigable areas extraction algorithm
@@ -235,7 +249,7 @@ class NavigableAreaSegmentation:
     -   Apply the mask onto the segments to obtain final navigable areas as a binary image (as white)
     '''
 
-    def extract_navigable_areas(self, segmented_img, pedest_loc, threshold):
+    def extract_navigable_areas(self, segmented_img, pedest_loc, threshold, show_results = False):
 
         # Canvas image is used to draw red circles on in order to debug the result better
         canvas_img = np.copy(segmented_img)
@@ -280,8 +294,11 @@ class NavigableAreaSegmentation:
             global_label += np.max(clusters)
 
         segmented_img = np.reshape(new_labels, segmented_img.shape).astype("uint8")
-        cv2.imshow("Instance labels", segmented_img)
-        cv2.waitKey(0)
+
+
+        if show_results:
+            cv2.imshow("Instance labels", segmented_img)
+            cv2.waitKey(0)
 
         palette = sea.color_palette('deep', np.unique(global_label).max() + 1)
         colors = [self.normalize_color(palette[x]) if x > 0 else (0.0, 0.0, 0.0) for x in
@@ -326,19 +343,20 @@ class NavigableAreaSegmentation:
         except IndexError:
             navigable_labels = []
 
-        print("Number of frames processed {}".format(prev_frame))
+        print("Number of detection data processed {}".format(prev_frame))
         print("Navigable labels: {}".format(navigable_labels))
 
         # In the end, create our mask and multiply it with segmentation result
         mask = np.where(np.isin(segmented_img, navigable_labels),
                         255, 0).astype("uint8")
 
-        cv2.imshow("Pedestrian Steps", canvas_img)
-        cv2.waitKey(0)
+        if show_results:
+            cv2.imshow("Pedestrian Steps", canvas_img)
+            cv2.waitKey(0)
 
         cv2.destroyAllWindows()
 
-        return mask, canvas_img
+        return mask, canvas_img, prev_frame
 
     # Taken from: https://www.tensorflow.org/guide/migrate#a_graphpb_or_graphpbtxt
     @staticmethod
