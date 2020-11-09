@@ -308,15 +308,24 @@ class NavigableAreaSegmentation:
 
         # endregion
 
+        per_frame_labels = []
+
         # Open the pedestrian locations file and parse it
         with open(pedest_loc) as pedestrians:
+
             for i, line in enumerate(pedestrians):
                 locations = line.split(',')
                 feet = list(map(float, locations[-1].split('/')))
 
                 frame_index = int(locations[0])
+
+                # Progressed to the next frame, add previous frame's navigable labels
                 if frame_index > prev_frame:
                     prev_frame = frame_index
+
+                    # Only update the navigable pixels when we are done with the previous frame
+                    navigable_labels.extend(np.unique(per_frame_labels))
+                    per_frame_labels = []
 
                 # Find the label value there, in order to add it to the navigable list
                 try:  # Some trackers might go over bounds
@@ -326,10 +335,12 @@ class NavigableAreaSegmentation:
 
                 # Ignore noisy areas
                 if not pixel_value == 0:
-                    navigable_labels.append(pixel_value)
+                    per_frame_labels.append(pixel_value)
                     # Put a dot at the feet position for debugging the detections' location
                     cv2.circle(canvas_img, (int(feet[0]), int(feet[1])), 3,
                                (255, 255, 255))
+
+        navigable_labels.extend(np.unique(per_frame_labels))
 
         navigable_labels_freq = np.bincount(navigable_labels)
         navigable_labels = list(zip(list(set(navigable_labels)), navigable_labels_freq[navigable_labels]))
